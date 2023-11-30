@@ -30,11 +30,7 @@ import org.apache.kafka.connect.storage.ConverterType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * @author Adobe Inc.
@@ -44,6 +40,7 @@ public abstract class AbstractSinkTask<T> extends SinkTask {
   private static final Logger LOG = LoggerFactory.getLogger(AbstractSinkConnector.class);
   private static final String FLUSH_INTERVAL_SECS = "aep.flush.interval.seconds";
   private static final String FLUSH_BYTES_KB = "aep.flush.bytes.kb";
+  private static final String DISTINCT_EVENTS_PER_BATCH = "aep.distinct.events.per.batch";
   private static final int DEFAULT_FLUSH_INTERVAL = 1;
   private static final int DEFAULT_FLUSH_BYTES_KB = 4;
   private static final int MILLIS_IN_A_SEC = 1000;
@@ -52,6 +49,7 @@ public abstract class AbstractSinkTask<T> extends SinkTask {
   private int bytesRead = 0;
   private int flushIntervalMillis;
   private int flushBytesCount;
+  private boolean distinctEventsPerBatch;
   private long lastFlushMilliSec = System.currentTimeMillis();
   private ErrantRecordReporter errantRecordReporter;
   protected JsonConverter jsonValueConverter;
@@ -84,6 +82,7 @@ public abstract class AbstractSinkTask<T> extends SinkTask {
     try {
       flushIntervalMillis = SinkUtils.getProperty(props, FLUSH_INTERVAL_SECS, DEFAULT_FLUSH_INTERVAL, MILLIS_IN_A_SEC);
       flushBytesCount = SinkUtils.getProperty(props, FLUSH_BYTES_KB, DEFAULT_FLUSH_BYTES_KB, BYTES_IN_A_KB);
+      distinctEventsPerBatch = SinkUtils.getProperty(props, DISTINCT_EVENTS_PER_BATCH, "false").equalsIgnoreCase("true");
 
       init(props, errantRecordReporter);
       LOG.info("Connection created with flush interval {} secs and flush bytes {} KB",
@@ -109,17 +108,26 @@ public abstract class AbstractSinkTask<T> extends SinkTask {
     }
 
     List<T> eventsToPublish = new ArrayList<>();
+    HashSet<Object> keysInBatch = new HashSet<>();
     for (SinkRecord record : records) {
-      T dataToPublish = getDataToPublish(Pair.of(SinkUtils.getStringPayload(jsonValueConverter, record), record));
-      eventsToPublish.add(dataToPublish);
-      bytesRead += getPayloadLength(dataToPublish);
       long tempCurrTime = System.currentTimeMillis();
+      T dataToPublish = getDataToPublish(Pair.of(SinkUtils.getStringPayload(jsonValueConverter, record), record));
+      if (distinctEventsPerBatch && keysInBatch.contains(record.key())) {
+        publishAndLogIfRequired(eventsToPublish);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("ConnectorSinkTask: {} events flushed partially due to duplicate data for key", eventsToPublish.size());
+        }
+        reset(eventsToPublish, tempCurrTime, keysInBatch);
+      }
+      eventsToPublish.add(dataToPublish);
+      keysInBatch.add(record.key());
+      bytesRead += getPayloadLength(dataToPublish);
       if (flushNow(tempCurrTime)) {
         publishAndLogIfRequired(eventsToPublish);
         if (LOG.isDebugEnabled()) {
           LOG.debug("ConnectorSinkTask: {} events flushed partially", eventsToPublish.size());
         }
-        reset(eventsToPublish, tempCurrTime);
+        reset(eventsToPublish, tempCurrTime, keysInBatch);
       }
     }
 
@@ -128,7 +136,7 @@ public abstract class AbstractSinkTask<T> extends SinkTask {
       if (LOG.isDebugEnabled()) {
         LOG.debug("ConnectorSinkTask: {} events flushed finally", eventsToPublish.size());
       }
-      reset(eventsToPublish, System.currentTimeMillis());
+      reset(eventsToPublish, System.currentTimeMillis(), keysInBatch);
     }
   }
 
@@ -156,9 +164,10 @@ public abstract class AbstractSinkTask<T> extends SinkTask {
     }
   }
 
-  private void reset(List<T> eventsToPublish, long tempCurrentTime) {
+  private void reset(List<T> eventsToPublish, long tempCurrentTime, HashSet<Object> keysInBatch) {
     lastFlushMilliSec = tempCurrentTime;
     bytesRead = 0;
     eventsToPublish.clear();
+    keysInBatch.clear();
   }
 }
